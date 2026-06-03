@@ -82,70 +82,127 @@ function downloadFile(url, dest, headers = {}) {
 }
 
 // ──────────────────────────────────────────
-// Reddit: HTML scraping approach
+// Reddit: Multi-strategy approach
 // ──────────────────────────────────────────
 async function getRedditVideoInfo(url) {
   let cleanUrl = url.split("?")[0];
   if (!cleanUrl.endsWith("/")) cleanUrl += "/";
 
+  const urlObj = new URL(cleanUrl);
+  const postPath = urlObj.pathname;
   const errors = [];
 
-  // Approach 1: Fetch HTML page and extract video data from embedded JSON
-  const htmlUrls = [
-    cleanUrl,
-    cleanUrl.replace("www.reddit.com", "old.reddit.com"),
-    cleanUrl.replace("www.reddit.com", "i.reddit.com"),
-  ];
-
-  for (const pageUrl of htmlUrls) {
-    try {
-      const resp = await httpGet(pageUrl, {
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      });
-
-      if (resp.status === 200 && resp.data) {
-        const result = extractVideoFromHtml(resp.data, url);
-        if (result) return result;
-        errors.push(`html(${new URL(pageUrl).hostname}): no video found in page`);
-      } else {
-        errors.push(`html(${new URL(pageUrl).hostname}): ${resp.status}`);
-      }
-    } catch (e) {
-      errors.push(`html: ${e.message}`);
+  // Strategy 1: redditmedia.com embed (designed for third-party, different blocking rules)
+  try {
+    const embedUrl = `https://www.redditmedia.com${postPath}?ref_source=embed&ref=share&embed=true`;
+    const resp = await httpGet(embedUrl, {
+      "Accept": "text/html,application/xhtml+xml,*/*",
+      "Referer": "https://www.reddit.com/",
+    });
+    if (resp.status === 200 && resp.data) {
+      const result = extractVideoFromHtml(resp.data, url);
+      if (result) return result;
+      errors.push("redditmedia: no video in embed");
+    } else {
+      errors.push(`redditmedia: ${resp.status}`);
     }
-  }
+  } catch (e) { errors.push(`redditmedia: ${e.message}`); }
 
-  // Approach 2: Try JSON endpoints anyway (might work on some hosts)
-  const jsonUrls = [
-    cleanUrl.replace("www.reddit.com", "old.reddit.com") + ".json?raw_json=1&limit=1",
+  // Strategy 2: JSON with consent cookies (bypass cookie wall)
+  const consentCookies = "over18=1; _options=%7B%22pref_quarantine_optin%22%3Atrue%7D; reddit_session=; loid=; edgebucket=; csv=1; eu_cookie_v2=3; recent_srs=";
+  const jsonEndpoints = [
     cleanUrl + ".json?raw_json=1&limit=1",
+    cleanUrl.replace("www.reddit.com", "old.reddit.com") + ".json?raw_json=1&limit=1",
+    cleanUrl.replace("www.reddit.com", "gateway.reddit.com") + ".json?raw_json=1&limit=1",
+    `https://api.reddit.com${postPath}.json?raw_json=1&limit=1`,
   ];
 
-  for (const jsonUrl of jsonUrls) {
+  for (const jsonUrl of jsonEndpoints) {
     try {
       const resp = await httpGet(jsonUrl, {
-        "Accept": "application/json",
-        "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+        "Accept": "application/json, text/plain, */*",
+        "Cookie": consentCookies,
+        "Referer": "https://www.reddit.com/",
       });
       if (resp.status === 200) {
         const parsed = parseRedditJson(resp.data);
         if (parsed) return parsed;
+        errors.push(`json(${new URL(jsonUrl).hostname}): parsed but no video`);
+      } else {
+        errors.push(`json(${new URL(jsonUrl).hostname}): ${resp.status}`);
       }
-      errors.push(`json(${new URL(jsonUrl).hostname}): ${resp.status}`);
-    } catch (e) {
-      errors.push(`json: ${e.message}`);
-    }
+    } catch (e) { errors.push(`json(${jsonUrl.split("/")[2]}): ${e.message}`); }
   }
 
-  // Approach 3: Try v.redd.it embed page
+  // Strategy 3: HTML with consent cookies
+  const htmlEndpoints = [
+    cleanUrl,
+    cleanUrl.replace("www.reddit.com", "old.reddit.com"),
+    `https://www.reddit.com${postPath}?utm_source=share&utm_medium=web3x`,
+  ];
+
+  for (const pageUrl of htmlEndpoints) {
+    try {
+      const resp = await httpGet(pageUrl, {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Cookie": consentCookies,
+        "Referer": "https://www.reddit.com/",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin",
+      });
+      if (resp.status === 200 && resp.data) {
+        const result = extractVideoFromHtml(resp.data, url);
+        if (result) return result;
+        errors.push(`html(${new URL(pageUrl).hostname}): no video in page`);
+      } else {
+        errors.push(`html(${new URL(pageUrl).hostname}): ${resp.status}`);
+      }
+    } catch (e) { errors.push(`html: ${e.message}`); }
+  }
+
+  // Strategy 4: RSS feed (often less restricted)
   try {
-    const embedResult = await tryRedditEmbed(url);
-    if (embedResult) return embedResult;
-  } catch (e) {
-    errors.push(`embed: ${e.message}`);
-  }
+    const rssUrl = cleanUrl + ".rss";
+    const resp = await httpGet(rssUrl, {
+      "Accept": "application/rss+xml, application/xml, text/xml, */*",
+      "Cookie": consentCookies,
+    });
+    if (resp.status === 200 && resp.data) {
+      const result = extractVideoFromHtml(resp.data, url);
+      if (result) return result;
+      errors.push("rss: no video in feed");
+    } else {
+      errors.push(`rss: ${resp.status}`);
+    }
+  } catch (e) { errors.push(`rss: ${e.message}`); }
 
-  throw new Error(`Could not fetch Reddit video. Tried ${errors.length} approaches. Details: ${errors.join(" | ")}`);
+  // Strategy 5: Reddit oEmbed
+  try {
+    const oembedUrl = `https://www.reddit.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+    const resp = await httpGet(oembedUrl, { "Accept": "application/json" });
+    if (resp.status === 200) {
+      const data = JSON.parse(resp.data);
+      if (data.html) {
+        const srcMatch = data.html.match(/src="([^"]+)"/);
+        if (srcMatch) {
+          const embedResp = await httpGet(srcMatch[1].replace(/&amp;/g, "&"), {
+            "Accept": "text/html,*/*",
+            "Referer": "https://www.reddit.com/",
+          });
+          if (embedResp.status === 200) {
+            const result = extractVideoFromHtml(embedResp.data, url);
+            if (result) return result;
+          }
+        }
+      }
+      errors.push("oembed: parsed but no video extracted");
+    } else {
+      errors.push(`oembed: ${resp.status}`);
+    }
+  } catch (e) { errors.push(`oembed: ${e.message}`); }
+
+  throw new Error(`Reddit blocked all ${errors.length} approaches from this server. Details: ${errors.join(" | ")}`);
 }
 
 function extractVideoFromHtml(html, originalUrl) {
@@ -261,27 +318,6 @@ function parseRedditJson(rawData) {
       is_gif: videoSource.is_gif || false,
     };
   } catch { return null; }
-}
-
-async function tryRedditEmbed(url) {
-  // Try Reddit's oEmbed endpoint
-  try {
-    const oembedUrl = `https://www.reddit.com/oembed?url=${encodeURIComponent(url)}`;
-    const resp = await httpGet(oembedUrl, { "Accept": "application/json" });
-    if (resp.status === 200) {
-      const data = JSON.parse(resp.data);
-      if (data.html) {
-        const srcMatch = data.html.match(/src="([^"]+)"/);
-        if (srcMatch) {
-          const embedPageResp = await httpGet(srcMatch[1]);
-          if (embedPageResp.status === 200) {
-            return extractVideoFromHtml(embedPageResp.data, url);
-          }
-        }
-      }
-    }
-  } catch {}
-  return null;
 }
 
 async function downloadRedditVideo(videoUrl, audioUrl, isGif, outputPath, videoId) {
