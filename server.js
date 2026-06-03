@@ -54,61 +54,156 @@ function httpGet(url, headers = {}, maxRedirects = 5) {
 // ──────────────────────────────────────────
 // Reddit: Direct JSON API (no yt-dlp needed)
 // ──────────────────────────────────────────
+// Reddit OAuth + Direct API
+// ──────────────────────────────────────────
+const REDDIT_CLIENT_ID = process.env.REDDIT_CLIENT_ID || "";
+const REDDIT_CLIENT_SECRET = process.env.REDDIT_CLIENT_SECRET || "";
+let redditToken = null;
+let redditTokenExpiry = 0;
+
+function httpPost(url, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const postData = typeof body === "string" ? body : new URLSearchParams(body).toString();
+    const opts = {
+      hostname: u.hostname,
+      port: u.port || 443,
+      path: u.pathname + u.search,
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(postData),
+        "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+        ...headers,
+      },
+      timeout: 15000,
+    };
+    const req = https.request(opts, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => resolve({ status: res.statusCode, data }));
+    });
+    req.on("error", reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+async function getRedditOAuthToken() {
+  if (redditToken && Date.now() < redditTokenExpiry) return redditToken;
+  if (!REDDIT_CLIENT_ID || !REDDIT_CLIENT_SECRET) return null;
+
+  try {
+    const auth = Buffer.from(`${REDDIT_CLIENT_ID}:${REDDIT_CLIENT_SECRET}`).toString("base64");
+    const resp = await httpPost("https://www.reddit.com/api/v1/access_token", {
+      grant_type: "client_credentials",
+    }, {
+      "Authorization": `Basic ${auth}`,
+    });
+
+    if (resp.status === 200) {
+      const data = JSON.parse(resp.data);
+      if (data.access_token) {
+        redditToken = data.access_token;
+        redditTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+        console.log("Reddit OAuth token acquired");
+        return redditToken;
+      }
+    }
+    console.error("Reddit OAuth failed:", resp.data);
+    return null;
+  } catch (e) {
+    console.error("Reddit OAuth error:", e.message);
+    return null;
+  }
+}
+
 async function getRedditVideoInfo(url) {
-  // Normalize URL — strip query params, ensure it ends with .json
   let cleanUrl = url.split("?")[0];
   if (!cleanUrl.endsWith("/")) cleanUrl += "/";
-  const jsonUrl = cleanUrl + ".json";
 
-  const resp = await httpGet(jsonUrl, {
-    "Accept": "application/json",
-  });
+  // Extract the post path (e.g., /r/SipsTea/comments/1tum8zf/...)
+  const urlObj = new URL(cleanUrl);
+  const postPath = urlObj.pathname;
 
-  if (resp.status !== 200) throw new Error(`Reddit returned ${resp.status}`);
+  const errors = [];
 
-  const json = JSON.parse(resp.data);
+  // Approach 1: OAuth API (most reliable for cloud servers)
+  const token = await getRedditOAuthToken();
+  if (token) {
+    try {
+      const oauthUrl = `https://oauth.reddit.com${postPath}.json?raw_json=1&limit=1`;
+      const resp = await httpGet(oauthUrl, {
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+        "Accept": "application/json",
+      });
+      if (resp.status === 200) return parseRedditJson(resp.data);
+      errors.push(`oauth: ${resp.status}`);
+    } catch (e) { errors.push(`oauth: ${e.message}`); }
+  } else {
+    errors.push("oauth: no credentials configured");
+  }
+
+  // Approach 2: old.reddit.com (works on some hosts)
+  try {
+    const oldUrl = cleanUrl.replace("www.reddit.com", "old.reddit.com") + ".json?raw_json=1&limit=1";
+    const resp = await httpGet(oldUrl, {
+      "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+      "Accept": "application/json",
+    });
+    if (resp.status === 200) return parseRedditJson(resp.data);
+    errors.push(`old.reddit: ${resp.status}`);
+  } catch (e) { errors.push(`old.reddit: ${e.message}`); }
+
+  // Approach 3: www.reddit.com fallback
+  try {
+    const jsonUrl = cleanUrl + ".json?raw_json=1&limit=1";
+    const resp = await httpGet(jsonUrl, {
+      "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+      "Accept": "application/json",
+    });
+    if (resp.status === 200) return parseRedditJson(resp.data);
+    errors.push(`www: ${resp.status}`);
+  } catch (e) { errors.push(`www: ${e.message}`); }
+
+  const hasOAuth = !!REDDIT_CLIENT_ID;
+  throw new Error(
+    hasOAuth
+      ? `All Reddit approaches failed: ${errors.join(", ")}`
+      : "Reddit blocks cloud servers. Set REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET env vars for OAuth access. See /api/setup for instructions."
+  );
+}
+
+function parseRedditJson(rawData) {
+  const json = JSON.parse(rawData);
   const post = json?.[0]?.data?.children?.[0]?.data;
   if (!post) throw new Error("Could not parse Reddit post");
 
   // Reddit hosted video
-  if (post.is_video && post.media?.reddit_video) {
-    const rv = post.media.reddit_video;
-    return {
-      title: post.title || "Reddit Video",
-      thumbnail: post.thumbnail && post.thumbnail !== "default" ? post.thumbnail : null,
-      duration: rv.duration || null,
-      platform: "Reddit",
-      uploader: post.author || null,
-      video_url: rv.fallback_url,
-      audio_url: rv.fallback_url.replace(/DASH_\d+/, "DASH_AUDIO_128").split("?")[0],
-      dash_url: rv.dash_url || null,
-      height: rv.height,
-      width: rv.width,
-      is_gif: rv.is_gif || false,
-    };
-  }
+  const videoSource = post.is_video && post.media?.reddit_video
+    ? { post, rv: post.media.reddit_video }
+    : post.crosspost_parent_list?.length > 0 &&
+      post.crosspost_parent_list[0].is_video &&
+      post.crosspost_parent_list[0].media?.reddit_video
+      ? { post, rv: post.crosspost_parent_list[0].media.reddit_video }
+      : null;
 
-  // Crosspost with video
-  if (post.crosspost_parent_list?.length > 0) {
-    const cross = post.crosspost_parent_list[0];
-    if (cross.is_video && cross.media?.reddit_video) {
-      const rv = cross.media.reddit_video;
-      return {
-        title: post.title || "Reddit Video",
-        thumbnail: post.thumbnail && post.thumbnail !== "default" ? post.thumbnail : null,
-        duration: rv.duration || null,
-        platform: "Reddit",
-        uploader: post.author || null,
-        video_url: rv.fallback_url,
-        audio_url: rv.fallback_url.replace(/DASH_\d+/, "DASH_AUDIO_128").split("?")[0],
-        height: rv.height,
-        width: rv.width,
-        is_gif: rv.is_gif || false,
-      };
-    }
-  }
+  if (!videoSource) throw new Error("No video found. This may be an image, text post, or external link.");
 
-  throw new Error("No Reddit video found in this post. It may be an image, text post, or external link.");
+  const { rv } = videoSource;
+  return {
+    title: post.title || "Reddit Video",
+    thumbnail: post.thumbnail && post.thumbnail !== "default" ? post.thumbnail.replace(/&amp;/g, "&") : null,
+    duration: rv.duration || null,
+    platform: "Reddit",
+    uploader: post.author || null,
+    video_url: rv.fallback_url,
+    audio_url: rv.fallback_url.replace(/DASH_\d+/, "DASH_AUDIO_128").split("?")[0],
+    height: rv.height,
+    width: rv.width,
+    is_gif: rv.is_gif || false,
+  };
 }
 
 async function downloadRedditVideo(videoUrl, audioUrl, isGif, outputPath) {
@@ -450,7 +545,31 @@ app.get("/api/health", (req, res) => {
   const ytdlp = getYtdlpPath();
   let ver = "not installed";
   if (ytdlp) try { ver = execSync(`${ytdlp} --version`).toString().trim(); } catch {}
-  res.json({ status: "ok", ytdlp: !!ytdlp, ytdlp_version: ver, timestamp: new Date().toISOString() });
+  res.json({
+    status: "ok",
+    ytdlp: !!ytdlp,
+    ytdlp_version: ver,
+    reddit_oauth: !!REDDIT_CLIENT_ID,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Setup instructions
+app.get("/api/setup", (req, res) => {
+  res.json({
+    reddit_oauth: {
+      configured: !!REDDIT_CLIENT_ID,
+      instructions: [
+        "1. Go to https://www.reddit.com/prefs/apps",
+        "2. Click 'create another app' at the bottom",
+        "3. Name: SaveIt, Type: select 'script', Redirect URI: http://localhost:3000",
+        "4. Click 'create app'",
+        "5. Copy the client ID (under the app name) and secret",
+        "6. In Railway: Settings > Variables, add REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET",
+        "7. Redeploy the service",
+      ],
+    },
+  });
 });
 
 app.get("*", (req, res) => res.sendFile(path.join(__dirname, "public", "index.html")));
