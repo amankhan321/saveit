@@ -408,6 +408,7 @@
   <script>
     let currentVideoUrl = "";
     let selectedQuality = "best";
+    let currentRedditData = null;
 
     const $ = (id) => document.getElementById(id);
 
@@ -466,6 +467,7 @@
         }
 
         currentVideoUrl = url;
+        currentRedditData = data._reddit || null;
         highlightPlatform(data.platform);
 
         // Populate card
@@ -520,7 +522,7 @@
         const response = await fetch("/api/download", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: currentVideoUrl, quality: selectedQuality }),
+          body: JSON.stringify({ url: currentVideoUrl, quality: selectedQuality, _reddit: currentRedditData }),
         });
 
         const reader = response.body.getReader();
@@ -544,7 +546,7 @@
                 const pct = Math.round(msg.percent);
                 $("progressFill").style.width = `${pct}%`;
                 $("progressPercent").textContent = `${pct}%`;
-                $("progressStatus").textContent = "Downloading...";
+                $("progressStatus").textContent = msg.status || "Downloading...";
               }
 
               if (msg.type === "done") {
