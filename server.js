@@ -413,12 +413,31 @@ function isValidUrl(str) {
   try { const u = new URL(str); return ["http:", "https:"].includes(u.protocol); } catch { return false; }
 }
 
-function ytdlpBaseArgs() {
-  return [
+function ytdlpBaseArgs(url) {
+  const platform = url ? detectPlatform(url) : "Unknown";
+  const args = [
     "--no-warnings", "--no-playlist", "--no-check-certificates",
     "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     "--extractor-retries", "5", "--socket-timeout", "30", "--force-ipv4", "--geo-bypass",
   ];
+
+  if (platform === "Twitter/X") {
+    // Twitter syndication API works without login and is more reliable
+    args.push("--extractor-args", "twitter:api=syndication");
+  }
+
+  if (platform === "TikTok") {
+    // Get watermark-free version, use API hostname that's more permissive
+    args.push("--extractor-args", "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com");
+    args.push("--referer", "https://www.tiktok.com/");
+  }
+
+  if (platform === "Instagram") {
+    args.push("--add-header", "X-IG-App-ID:936619743392459");
+    args.push("--referer", "https://www.instagram.com/");
+  }
+
+  return args;
 }
 
 function cleanupTemp() {
@@ -441,28 +460,24 @@ app.post("/api/info", async (req, res) => {
   if (!url || !isValidUrl(url)) return res.status(400).json({ error: "Invalid URL." });
   const platform = detectPlatform(url);
 
-  // Reddit — HTML scraping
+  // Reddit and YouTube don't work reliably from cloud-hosted servers (IP blocking).
+  // Return a clear message instead of failing slowly.
   if (platform === "Reddit") {
-    try {
-      const info = await getRedditVideoInfo(url);
-      const qualities = [{ id: "best", label: `Best Quality (${info.height}p)`, type: "video" }];
-      if (!info.is_gif) qualities.push({ id: "bestaudio", label: "Audio Only", type: "audio" });
-      return res.json({
-        title: info.title, thumbnail: info.thumbnail, duration: info.duration,
-        platform: "Reddit", uploader: info.uploader ? `u/${info.uploader}` : null, qualities,
-        _reddit: { video_url: info.video_url, audio_url: info.audio_url, is_gif: info.is_gif, _videoId: info._videoId || null },
-      });
-    } catch (err) {
-      console.error("Reddit error:", err.message);
-      return res.status(422).json({ error: err.message });
-    }
+    return res.status(422).json({
+      error: "Reddit isn't supported on this deployment — Reddit blocks requests from cloud hosting IPs. Supported: Twitter/X, Instagram, TikTok.",
+    });
+  }
+  if (platform === "YouTube") {
+    return res.status(422).json({
+      error: "YouTube isn't supported on this deployment — YouTube blocks cloud servers. Supported: Twitter/X, Instagram, TikTok.",
+    });
   }
 
   // Other platforms — yt-dlp
   const ytdlp = getYtdlpPath();
   if (!ytdlp) return res.status(500).json({ error: "yt-dlp not installed." });
 
-  const args = [...ytdlpBaseArgs(), "--dump-json", "--flat-playlist", url];
+  const args = [...ytdlpBaseArgs(url), "--dump-json", "--flat-playlist", url];
   const proc = spawn(ytdlp, args, { timeout: 60000 });
   let stdout = "", stderr = "";
   proc.stdout.on("data", (d) => (stdout += d.toString()));
@@ -546,7 +561,7 @@ app.post("/api/download", async (req, res) => {
   else if (quality?.startsWith("res_")) { const h = quality.replace("res_", ""); formatArg = `bestvideo[height<=${h}]+bestaudio/best[height<=${h}]/best`; }
   else formatArg = "bestvideo+bestaudio/best";
 
-  const args = [...ytdlpBaseArgs(), "-f", formatArg, "--merge-output-format", quality === "bestaudio" ? "m4a" : "mp4", "--newline", "--progress", "-o", outputTemplate, url];
+  const args = [...ytdlpBaseArgs(url), "-f", formatArg, "--merge-output-format", quality === "bestaudio" ? "m4a" : "mp4", "--newline", "--progress", "-o", outputTemplate, url];
   const proc = spawn(ytdlp, args, { timeout: 180000 });
   let lastProgress = 0;
 
