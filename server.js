@@ -413,6 +413,28 @@ function isValidUrl(str) {
   try { const u = new URL(str); return ["http:", "https:"].includes(u.protocol); } catch { return false; }
 }
 
+// Write Twitter cookies from env var to a file (once at startup)
+let TWITTER_COOKIE_FILE = null;
+function initTwitterCookies() {
+  const raw = process.env.TWITTER_COOKIES;
+  if (!raw || !raw.trim()) return;
+  try {
+    const cookiePath = path.join(TEMP_DIR, "twitter_cookies.txt");
+    let content = raw.trim();
+    // Accept either a full Netscape cookies.txt (has the header) or raw lines.
+    if (!content.startsWith("# Netscape") && !content.startsWith("# HTTP Cookie")) {
+      content = "# Netscape HTTP Cookie File\n" + content;
+    }
+    // Normalize literal "\n" sequences (Railway env vars often store newlines this way)
+    content = content.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+    fs.writeFileSync(cookiePath, content, "utf8");
+    TWITTER_COOKIE_FILE = cookiePath;
+    console.log("✓ Twitter cookies loaded");
+  } catch (e) {
+    console.error("Failed to write Twitter cookies:", e.message);
+  }
+}
+
 function ytdlpBaseArgs(url) {
   const platform = url ? detectPlatform(url) : "Unknown";
   const args = [
@@ -422,12 +444,16 @@ function ytdlpBaseArgs(url) {
   ];
 
   if (platform === "Twitter/X") {
-    // Twitter syndication API works without login and is more reliable
-    args.push("--extractor-args", "twitter:api=syndication");
+    // Twitter now requires auth for most video. Use cookies if available.
+    if (TWITTER_COOKIE_FILE && fs.existsSync(TWITTER_COOKIE_FILE)) {
+      args.push("--cookies", TWITTER_COOKIE_FILE);
+    } else {
+      // Fall back to syndication API (works for some public tweets without login)
+      args.push("--extractor-args", "twitter:api=syndication");
+    }
   }
 
   if (platform === "TikTok") {
-    // Get watermark-free version, use API hostname that's more permissive
     args.push("--extractor-args", "tiktok:api_hostname=api22-normal-c-useast2a.tiktokv.com");
     args.push("--referer", "https://www.tiktok.com/");
   }
@@ -485,11 +511,14 @@ app.post("/api/info", async (req, res) => {
   proc.on("close", (code) => {
     if (code !== 0) {
       console.error(`yt-dlp info (${platform}):`, stderr.slice(0, 500));
-      return res.status(422).json({
-        error: platform === "YouTube"
-          ? "YouTube blocks cloud servers. This is a known limitation."
-          : `Could not fetch from ${platform}. URL may be invalid or private.`,
-      });
+      const needsAuth = /authentication|cookies|log\s?in|guest token|NSFW/i.test(stderr);
+      let msg = `Could not fetch from ${platform}. URL may be invalid or private.`;
+      if (platform === "Twitter/X") {
+        msg = needsAuth || !TWITTER_COOKIE_FILE
+          ? "Twitter/X needs login cookies to download this video. The server's cookies may be missing or expired."
+          : "Could not fetch this Twitter/X video. It may be private, deleted, or age-restricted.";
+      }
+      return res.status(422).json({ error: msg });
     }
     try {
       const info = JSON.parse(stdout);
@@ -621,6 +650,7 @@ app.get("*", (req, res) => res.sendFile(path.join(__dirname, "public", "index.ht
 
 app.listen(PORT, () => {
   console.log(`SaveIt running on port ${PORT}`);
+  initTwitterCookies();
   const ytdlp = getYtdlpPath();
   if (ytdlp) try { console.log("yt-dlp", execSync(`${ytdlp} --version`).toString().trim()); } catch {}
 });
