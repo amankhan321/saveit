@@ -107,30 +107,135 @@ function downloadFile(url, dest, headers = {}) {
 }
 
 // ──────────────────────────────────────────
+// Reddit OAuth (application-only) — works from datacenter IPs
+// ──────────────────────────────────────────
+let redditToken = null;
+let redditTokenExpiry = 0;
+
+function getRedditToken() {
+  return new Promise((resolve, reject) => {
+    const id = process.env.REDDIT_CLIENT_ID;
+    const secret = process.env.REDDIT_CLIENT_SECRET;
+    if (!id || !secret) return reject(new Error("No Reddit credentials configured"));
+
+    // Reuse token if still valid (with 60s buffer)
+    if (redditToken && Date.now() < redditTokenExpiry - 60000) {
+      return resolve(redditToken);
+    }
+
+    const auth = Buffer.from(`${id}:${secret}`).toString("base64");
+    const postData = "grant_type=client_credentials";
+    const req = https.request({
+      hostname: "www.reddit.com",
+      path: "/api/v1/access_token",
+      method: "POST",
+      headers: {
+        "Authorization": `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Content-Length": Buffer.byteLength(postData),
+        "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+      },
+      timeout: 15000,
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          if (json.access_token) {
+            redditToken = json.access_token;
+            redditTokenExpiry = Date.now() + (json.expires_in || 3600) * 1000;
+            resolve(redditToken);
+          } else {
+            reject(new Error("No access_token in Reddit response: " + data.slice(0, 200)));
+          }
+        } catch (e) { reject(new Error("Token parse failed: " + data.slice(0, 200))); }
+      });
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Token request timeout")); });
+    req.write(postData);
+    req.end();
+  });
+}
+
+function redditApiGet(apiPath, token) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: "oauth.reddit.com",
+      path: apiPath,
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
+        "Accept": "application/json",
+      },
+      timeout: 15000,
+    }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => resolve({ status: res.statusCode, data }));
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("API timeout")); });
+    req.end();
+  });
+}
+
+// Resolve /s/ shortlink to a post ID using OAuth (avoids the blocked public site)
+async function resolveRedditViaOAuth(url) {
+  const token = await getRedditToken();
+  let cleanUrl = url.split("?")[0];
+
+  // For shortlinks, follow the redirect via oauth domain isn't possible,
+  // so resolve through the public redirect but only to read the Location header.
+  let postPath = new URL(cleanUrl).pathname;
+
+  if (/\/s\/[A-Za-z0-9]+\/?$/.test(cleanUrl)) {
+    const resolved = await resolveRedirect(cleanUrl);
+    if (resolved && resolved.includes("/comments/")) {
+      postPath = new URL(resolved.split("?")[0]).pathname;
+    }
+  }
+
+  // Hit the OAuth API for the post JSON
+  const apiPath = postPath.replace(/\/$/, "") + ".json?raw_json=1";
+  const resp = await redditApiGet(apiPath, token);
+  if (resp.status !== 200) {
+    throw new Error(`Reddit OAuth API returned ${resp.status}`);
+  }
+
+  const parsed = parseRedditJson(resp.data);
+  if (!parsed) throw new Error("No video found in this Reddit post (may be image/text/gallery).");
+  return parsed;
+}
+
+// ──────────────────────────────────────────
 // Reddit: Multi-strategy approach
 // ──────────────────────────────────────────
 async function getRedditVideoInfo(url) {
+  // Strategy 0: OAuth API (primary — only thing that works from datacenter IPs)
+  if (process.env.REDDIT_CLIENT_ID && process.env.REDDIT_CLIENT_SECRET) {
+    try {
+      return await resolveRedditViaOAuth(url);
+    } catch (e) {
+      console.error("Reddit OAuth failed, trying fallbacks:", e.message);
+      // fall through to public strategies below
+    }
+  }
+
   let cleanUrl = url.split("?")[0];
   if (!cleanUrl.endsWith("/")) cleanUrl += "/";
 
   // Resolve /s/ shortlinks to the real post URL first.
-  // These are share links that 301-redirect to /r/sub/comments/id/...
   if (/\/s\/[A-Za-z0-9]+\/?$/.test(cleanUrl)) {
     try {
-      const redirectResp = await httpGet(cleanUrl, {
-        "Accept": "text/html,*/*",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      });
-      // httpGet follows redirects and returns final data; we need the final URL.
-      // Re-resolve manually to capture the landing URL.
       const resolved = await resolveRedirect(cleanUrl);
       if (resolved && resolved.includes("/comments/")) {
         cleanUrl = resolved.split("?")[0];
         if (!cleanUrl.endsWith("/")) cleanUrl += "/";
       }
-    } catch (e) {
-      // fall through with original url
-    }
+    } catch (e) { /* fall through */ }
   }
 
   const urlObj = new URL(cleanUrl);
