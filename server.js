@@ -9,6 +9,19 @@ const https = require("https");
 const http = require("http");
 const { v4: uuidv4 } = require("uuid");
 
+// Optional residential proxy — set PROXY_URL env var (e.g. http://user:pass@host:port)
+let proxyAgent = null;
+const PROXY_URL = process.env.PROXY_URL || "";
+if (PROXY_URL) {
+  try {
+    const { HttpsProxyAgent } = require("https-proxy-agent");
+    proxyAgent = new HttpsProxyAgent(PROXY_URL);
+    console.log("✓ Proxy enabled");
+  } catch (e) {
+    console.error("Proxy setup failed:", e.message);
+  }
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = path.join(__dirname, "tmp");
@@ -36,6 +49,7 @@ function resolveRedirect(url, maxRedirects = 10) {
         "Accept": "text/html,*/*",
       },
       timeout: 15000,
+      agent: proxyAgent || undefined,
     }, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
         let next = res.headers.location;
@@ -63,7 +77,7 @@ function httpGet(url, headers = {}, maxRedirects = 8) {
       "Cache-Control": "no-cache",
       ...headers,
     };
-    lib.get(url, { headers: defaultHeaders, timeout: 20000 }, (res) => {
+    lib.get(url, { headers: defaultHeaders, timeout: 20000, agent: proxyAgent || undefined }, (res) => {
       if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
         let newUrl = res.headers.location;
         if (newUrl.startsWith("/")) { const u = new URL(url); newUrl = u.origin + newUrl; }
@@ -86,6 +100,7 @@ function downloadFile(url, dest, headers = {}) {
         ...headers,
       },
       timeout: 60000,
+      agent: proxyAgent || undefined,
     }, (res) => {
       if ([301, 302, 303, 307].includes(res.statusCode) && res.headers.location) {
         file.close();
@@ -136,6 +151,7 @@ function getRedditToken() {
         "User-Agent": "web:saveit:v1.0 (by /u/saveit_app)",
       },
       timeout: 15000,
+      agent: proxyAgent || undefined,
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
@@ -171,6 +187,7 @@ function redditApiGet(apiPath, token) {
         "Accept": "application/json",
       },
       timeout: 15000,
+      agent: proxyAgent || undefined,
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
@@ -593,6 +610,13 @@ function ytdlpBaseArgs(url) {
     "--extractor-retries", "5", "--socket-timeout", "30", "--force-ipv4", "--geo-bypass",
   ];
 
+  // Route YouTube through the proxy (it's the only yt-dlp platform that's IP-blocked).
+  // Twitter/IG/TikTok work on the datacenter IP directly, so we keep them off the
+  // proxy to stay fast and avoid burning proxy bandwidth.
+  if (PROXY_URL && platform === "YouTube") {
+    args.push("--proxy", PROXY_URL);
+  }
+
   if (platform === "Twitter/X") {
     // Twitter now requires auth for most video. Use cookies if available.
     if (TWITTER_COOKIE_FILE && fs.existsSync(TWITTER_COOKIE_FILE)) {
@@ -636,10 +660,10 @@ app.post("/api/info", async (req, res) => {
   if (!url || !isValidUrl(url)) return res.status(400).json({ error: "Invalid URL." });
   const platform = detectPlatform(url);
 
-  // YouTube blocks all datacenter IPs with bot detection — not supported.
-  if (platform === "YouTube") {
+  // YouTube blocks datacenter IPs; only attempt it when a proxy is configured.
+  if (platform === "YouTube" && !PROXY_URL) {
     return res.status(422).json({
-      error: "YouTube isn't supported — it blocks automated downloads from servers. Supported: Reddit, Twitter/X, Instagram, TikTok.",
+      error: "YouTube isn't supported on this deployment (blocked without a proxy). Supported: Reddit, Twitter/X, Instagram, TikTok.",
     });
   }
 
