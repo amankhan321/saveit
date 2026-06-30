@@ -26,6 +26,31 @@ app.use("/api/", limiter);
 // ──────────────────────────────────────────
 // HTTP helpers
 // ──────────────────────────────────────────
+function resolveRedirect(url, maxRedirects = 10) {
+  return new Promise((resolve, reject) => {
+    if (maxRedirects <= 0) return resolve(url);
+    const lib = url.startsWith("https") ? https : http;
+    const req = lib.get(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,*/*",
+      },
+      timeout: 15000,
+    }, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        let next = res.headers.location;
+        if (next.startsWith("/")) { const u = new URL(url); next = u.origin + next; }
+        res.resume(); // drain
+        return resolveRedirect(next, maxRedirects - 1).then(resolve).catch(reject);
+      }
+      res.resume();
+      resolve(url); // final URL (no more redirects)
+    });
+    req.on("error", reject);
+    req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
+  });
+}
+
 function httpGet(url, headers = {}, maxRedirects = 8) {
   return new Promise((resolve, reject) => {
     if (maxRedirects <= 0) return reject(new Error("Too many redirects"));
@@ -87,6 +112,26 @@ function downloadFile(url, dest, headers = {}) {
 async function getRedditVideoInfo(url) {
   let cleanUrl = url.split("?")[0];
   if (!cleanUrl.endsWith("/")) cleanUrl += "/";
+
+  // Resolve /s/ shortlinks to the real post URL first.
+  // These are share links that 301-redirect to /r/sub/comments/id/...
+  if (/\/s\/[A-Za-z0-9]+\/?$/.test(cleanUrl)) {
+    try {
+      const redirectResp = await httpGet(cleanUrl, {
+        "Accept": "text/html,*/*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      });
+      // httpGet follows redirects and returns final data; we need the final URL.
+      // Re-resolve manually to capture the landing URL.
+      const resolved = await resolveRedirect(cleanUrl);
+      if (resolved && resolved.includes("/comments/")) {
+        cleanUrl = resolved.split("?")[0];
+        if (!cleanUrl.endsWith("/")) cleanUrl += "/";
+      }
+    } catch (e) {
+      // fall through with original url
+    }
+  }
 
   const urlObj = new URL(cleanUrl);
   const postPath = urlObj.pathname;
@@ -485,6 +530,13 @@ app.post("/api/info", async (req, res) => {
   const { url } = req.body;
   if (!url || !isValidUrl(url)) return res.status(400).json({ error: "Invalid URL." });
   const platform = detectPlatform(url);
+
+  // YouTube blocks all datacenter IPs with bot detection — not supported.
+  if (platform === "YouTube") {
+    return res.status(422).json({
+      error: "YouTube isn't supported — it blocks automated downloads from servers. Supported: Reddit, Twitter/X, Instagram, TikTok.",
+    });
+  }
 
   // Reddit — use direct API/scraping (works from clean datacenter IPs)
   if (platform === "Reddit") {
