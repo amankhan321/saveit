@@ -486,17 +486,21 @@ app.post("/api/info", async (req, res) => {
   if (!url || !isValidUrl(url)) return res.status(400).json({ error: "Invalid URL." });
   const platform = detectPlatform(url);
 
-  // Reddit and YouTube don't work reliably from cloud-hosted servers (IP blocking).
-  // Return a clear message instead of failing slowly.
+  // Reddit — use direct API/scraping (works from clean datacenter IPs)
   if (platform === "Reddit") {
-    return res.status(422).json({
-      error: "Reddit isn't supported on this deployment — Reddit blocks requests from cloud hosting IPs. Supported: Twitter/X, Instagram, TikTok.",
-    });
-  }
-  if (platform === "YouTube") {
-    return res.status(422).json({
-      error: "YouTube isn't supported on this deployment — YouTube blocks cloud servers. Supported: Twitter/X, Instagram, TikTok.",
-    });
+    try {
+      const info = await getRedditVideoInfo(url);
+      const qualities = [{ id: "best", label: `Best Quality (${info.height}p)`, type: "video" }];
+      if (!info.is_gif) qualities.push({ id: "bestaudio", label: "Audio Only", type: "audio" });
+      return res.json({
+        title: info.title, thumbnail: info.thumbnail, duration: info.duration,
+        platform: "Reddit", uploader: info.uploader ? `u/${info.uploader}` : null, qualities,
+        _reddit: { video_url: info.video_url, audio_url: info.audio_url, is_gif: info.is_gif, _videoId: info._videoId || null },
+      });
+    } catch (err) {
+      console.error("Reddit error:", err.message);
+      return res.status(422).json({ error: "Could not fetch this Reddit video. It may be an image post, private, or deleted." });
+    }
   }
 
   // Other platforms — yt-dlp
