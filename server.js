@@ -660,14 +660,20 @@ app.post("/api/info", async (req, res) => {
   if (!url || !isValidUrl(url)) return res.status(400).json({ error: "Invalid URL." });
   const platform = detectPlatform(url);
 
-  // YouTube blocks datacenter IPs; only attempt it when a proxy is configured.
+  // YouTube and Reddit both block datacenter IPs. Only attempt when a residential
+  // proxy is configured (PROXY_URL). Otherwise return a clean unsupported message.
   if (platform === "YouTube" && !PROXY_URL) {
     return res.status(422).json({
-      error: "YouTube isn't supported on this deployment (blocked without a proxy). Supported: Reddit, Twitter/X, Instagram, TikTok.",
+      error: "YouTube isn't supported on this deployment. Supported: Twitter/X, Instagram, TikTok.",
+    });
+  }
+  if (platform === "Reddit" && !PROXY_URL) {
+    return res.status(422).json({
+      error: "Reddit isn't supported on this deployment. Supported: Twitter/X, Instagram, TikTok.",
     });
   }
 
-  // Reddit — use direct API/scraping (works from clean datacenter IPs)
+  // Reddit — direct API/scraping through proxy (only reached when PROXY_URL is set)
   if (platform === "Reddit") {
     try {
       const info = await getRedditVideoInfo(url);

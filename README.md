@@ -1,59 +1,45 @@
 # SaveIt — Video Downloader
 
-A clean, self-hosted video downloader for personal and educational use. Supports YouTube, Twitter/X, Instagram Reels, TikTok, and Reddit.
+A clean, self-hosted video downloader for personal and educational use.
+
+## Supported platforms
+
+- **Twitter/X** (with cookies — see TWITTER_SETUP.md)
+- **Instagram** (public reels/posts)
+- **TikTok** (public videos)
+
+Reddit and YouTube are **not supported by default** — both block downloads from datacenter/cloud IP addresses. They can be enabled by routing traffic through a residential proxy (set the `PROXY_URL` environment variable); the code paths are already built in and activate automatically when a proxy is configured.
 
 ## Tech Stack
 
 - **Backend**: Node.js + Express
 - **Frontend**: Vanilla HTML/CSS/JS
-- **Engine**: yt-dlp (must be installed on the host)
+- **Engine**: yt-dlp + ffmpeg
 
-## Requirements
+## Deployment (DigitalOcean droplet, Docker)
 
-- Node.js 18+
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) installed and available in PATH
-- ffmpeg (for merging video/audio streams)
-
-## Setup
+SSH into an Ubuntu droplet and run:
 
 ```bash
-# Install yt-dlp
-pip install yt-dlp
-
-# Install ffmpeg (Ubuntu/Debian)
-sudo apt install ffmpeg
-
-# Clone and install
-git clone https://github.com/amankhan321/saveit.git
-cd saveit
-npm install
-
-# Run
-npm start
+cd /
+git clone https://github.com/amankhan321/saveit.git /opt/saveit
+bash /opt/saveit/deploy-droplet.sh
 ```
 
-Open `http://localhost:3000` in your browser.
+The app runs on port 80. To update after code changes:
 
-## Features
+```bash
+cd /opt/saveit && git pull && docker build -t saveit . && docker rm -f saveit && \
+  docker run -d --name saveit --restart unless-stopped -p 80:3000 saveit
+```
 
-- Multi-platform support (YouTube, Twitter/X, Instagram, TikTok, Reddit)
-- Quality selection with resolution options
-- Real-time download progress via SSE
-- Audio-only extraction
-- Rate limiting and security headers
-- Auto-cleanup of temporary files
+### Optional environment variables
 
-## Deployment
+Add these with `-e VAR="value"` in the `docker run` command:
 
-This app requires a server environment with yt-dlp and ffmpeg installed. It is **not compatible with Vercel serverless functions** since yt-dlp needs a persistent process.
-
-**Recommended platforms:**
-- [Railway](https://railway.app) — easiest, supports Node.js + system packages
-- [Render](https://render.com) — free tier available
-- Any VPS (DigitalOcean, Linode, etc.)
-
-For Railway/Render, add a `nixpacks.toml` or `Dockerfile` to include yt-dlp and ffmpeg.
+- `TWITTER_COOKIES` — Netscape-format cookies to enable Twitter/X (see TWITTER_SETUP.md)
+- `PROXY_URL` — residential proxy (e.g. `http://user:pass@host:port`) to enable Reddit + YouTube
 
 ## Disclaimer
 
-This tool is for **personal and fair use only**. Respect copyright. Do not redistribute or commercially use downloaded content without permission from the original creator. This tool does not host, store, or cache any video content.
+For **personal and fair use only**. Respect copyright. Do not redistribute or commercially use downloaded content without permission. This tool does not host, store, or cache any video content.
